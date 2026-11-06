@@ -13,6 +13,24 @@ async function requireMarkEntryAccess(req,sid){
 
 const validTypes=new Set(['OPENER','CAT','TEST','MID_TERM','END_TERM','MOCK','FINAL','CUSTOM']);
 
+// Standard Zeraki special assessment mark codes:
+// X = Absent, Y = Irregularity/Cheating, M = Medical/Exempt
+const SPECIAL_MARK_CODES = new Set(['X','Y','M']);
+
+function parseSpecialOrNumericMark(rawVal, maxMark){
+  if(rawVal===null || rawVal===undefined) return { mark: null, status: null };
+  const s = String(rawVal).trim().toUpperCase();
+  if(!s) return { mark: null, status: null };
+  if(SPECIAL_MARK_CODES.has(s)){
+    return { mark: null, status: s };
+  }
+  const num = Number(s);
+  if(!Number.isFinite(num) || num < 0 || num > Number(maxMark)){
+    throw Object.assign(new Error(`Mark must be between 0 and ${maxMark}, or a valid status code (X: Absent, Y: Irregularity, M: Medical)`), {status: 400});
+  }
+  return { mark: num, status: null };
+}
+
 // GET ASSESSMENTS LIST
 router.get('/:schoolId/:yearId/:termId',schoolBoundary,async(req,res)=>{
   try{
@@ -149,10 +167,8 @@ router.post('/:schoolId/marks',schoolBoundary,roles('SCHOOL_ADMIN','ADMIN','HEAD
     if(String(a.status||'OPEN').toUpperCase()!=='OPEN')return res.status(403).json({error:'Assessment is closed'});
     if(a.deadline_at && new Date(a.deadline_at)<=new Date())return res.status(403).json({error:'The assessment deadline has passed'});
 
-    const mark=b.mark===null||b.mark===''?null:Number(b.mark);
-    if(mark!==null&&(!Number.isFinite(mark)||mark<0||mark>Number(a.max_mark))){
-      return res.status(400).json({error:`Mark must be between 0 and ${a.max_mark}`});
-    }
+    const parsed = parseSpecialOrNumericMark(b.mark, a.max_mark);
+    const finalRemark = parsed.status || String(b.remark||'').trim() || null;
 
     const q=await db.query(`
       INSERT INTO marks(school_id,learner_id,subject_id,class_id,academic_year_id,term_id,assessment_id,mark,entered_by,remark)
@@ -160,7 +176,7 @@ router.post('/:schoolId/marks',schoolBoundary,roles('SCHOOL_ADMIN','ADMIN','HEAD
       ON CONFLICT(learner_id,subject_id,assessment_id)
       DO UPDATE SET mark=EXCLUDED.mark,remark=EXCLUDED.remark,entered_by=EXCLUDED.entered_by,updated_at=now()
       RETURNING *`,
-      [sid,b.learner_id,b.subject_id,b.class_id,b.academic_year_id,a.term_id,b.assessment_id,mark,req.user.user_id,String(b.remark||'').trim()||null]
+      [sid,b.learner_id,b.subject_id,b.class_id,b.academic_year_id,a.term_id,b.assessment_id,parsed.mark,req.user.user_id,finalRemark]
     );
     res.json(q.rows);
   }catch(e){res.status(e.status||400).json({error:e.message});}
@@ -219,10 +235,8 @@ router.post('/:schoolId/marks/save',schoolBoundary,roles('SCHOOL_ADMIN','ADMIN',
       )).rows[0];
       if(!learner)throw Object.assign(new Error('One or more learners do not belong to the selected class.'),{status:400});
 
-      const mark=row.mark===null||row.mark===''?null:Number(row.mark);
-      if(mark!==null&&(!Number.isFinite(mark)||mark<0||mark>Number(assessment.max_mark))){
-        throw Object.assign(new Error(`Mark must be between 0 and ${assessment.max_mark}`),{status:400});
-      }
+      const parsed = parseSpecialOrNumericMark(row.mark, assessment.max_mark);
+      const rowRemark = parsed.status || String(row.remark||'').trim() || null;
 
       await client.query(`
         INSERT INTO marks(school_id,learner_id,subject_id,class_id,academic_year_id,term_id,assessment_id,mark,entered_by,remark)
@@ -230,7 +244,7 @@ router.post('/:schoolId/marks/save',schoolBoundary,roles('SCHOOL_ADMIN','ADMIN',
         ON CONFLICT(learner_id,subject_id,assessment_id)
         DO UPDATE SET mark=EXCLUDED.mark,remark=EXCLUDED.remark,entered_by=EXCLUDED.entered_by,updated_at=now()`,
         [sid,row.learner_id,assignment.subject_id,assignment.class_id,assignment.academic_year_id,
-         assessment.term_id,b.assessment_id,mark,req.user.user_id,null]
+         assessment.term_id,b.assessment_id,parsed.mark,req.user.user_id,rowRemark]
       );
       saved++;
     }
@@ -443,6 +457,155 @@ router.get('/:schoolId/assignment/:assignmentId/roster',schoolBoundary,roles('SC
     for(const m of marks){if(!byLearner.has(m.learner_id))byLearner.set(m.learner_id,[]);byLearner.get(m.learner_id).push(m);}
     res.json({ok:true,assignment,assessments,learners:learners.map(l=>({...l,marks:byLearner.get(l.learner_id)||[]}))});
   }catch(e){console.error('Teacher roster load failed:',e);res.status(e.status||400).json({error:e.message||'Unable to load mark sheet'});}
+});
+
+// CSV Mark Sheet Template Export (Zeraki-Style)
+router.get('/:schoolId/assignment/:assignmentId/marks-template-csv',schoolBoundary,roles('SCHOOL_ADMIN','ADMIN','HEADTEACHER','DEPUTY_HEADTEACHER','SENIOR_TEACHER','CLASS_TEACHER','TEACHER'),async(req,res)=>{
+  try{
+    const sid=req.params.schoolId,aid=req.params.assignmentId,assessmentId=String(req.query.assessment_id||'').trim();
+    if(!assessmentId)return res.status(400).json({error:'Assessment is required'});
+    const assignment=(await db.query(`
+      SELECT a.id assignment_id,a.teacher_id,a.subject_id,a.class_id,a.academic_year_id,s.code subject_code,s.name subject_name,c.name class_name,c.stream,lv.name level_name,ay.year_label,sc.name school_name
+      FROM teacher_subject_assignments a JOIN subjects s ON s.id=a.subject_id JOIN classes c ON c.id=a.class_id JOIN school_levels lv ON lv.id=c.school_level_id JOIN academic_years ay ON ay.id=a.academic_year_id JOIN schools sc ON sc.id=a.school_id
+      WHERE a.id=$1 AND a.school_id=$2 AND COALESCE(a.is_active,true)=true`,[aid,sid])).rows[0];
+    if(!assignment)return res.status(404).json({error:'Teacher assignment not found'});
+    if(['TEACHER','SENIOR_TEACHER','CLASS_TEACHER'].includes(req.user.role)){
+      const own=(await db.query(`SELECT 1 FROM teachers WHERE id=$1 AND school_id=$2 AND user_id=$3 AND COALESCE(is_active,true)=true`,[assignment.teacher_id,sid,req.user.user_id])).rows[0];
+      if(!own)return res.status(403).json({error:'You are not assigned to this subject and class.'});
+    }
+    const a=(await db.query(`SELECT id,name,assessment_type,max_mark FROM assessments WHERE id=$1 AND school_id=$2`,[assessmentId,sid])).rows[0];
+    if(!a)return res.status(404).json({error:'Assessment not found'});
+
+    const learners=(await db.query(`
+      SELECT DISTINCT l.id learner_id,l.admission_no,l.first_name,l.middle_name,l.last_name,m.mark,m.remark
+      FROM learners l
+      LEFT JOIN learner_enrollments le ON le.learner_id=l.id AND le.school_id=$1 AND le.academic_year_id=$2
+      LEFT JOIN marks m ON m.learner_id=l.id AND m.school_id=$1 AND m.subject_id=$3 AND m.class_id=$4 AND m.assessment_id=$5
+      WHERE l.school_id=$1 AND l.is_active=true AND ((le.class_id=$4) OR (le.id IS NULL AND l.class_id=$4))
+      ORDER BY l.last_name,l.first_name,l.middle_name`,[sid,assignment.academic_year_id,assignment.subject_id,assignment.class_id,assessmentId])).rows;
+
+    const escCsv=v=>{const s=String(v??'');return /[",\n\r]/.test(s)?`"${s.replace(/"/g,'""')}"`:s;};
+    const filename=`mark-sheet-${String(assignment.class_name||'class').replace(/[^a-z0-9]+/gi,'-')}-${String(assignment.subject_code||'sub').replace(/[^a-z0-9]+/gi,'-')}.csv`;
+    res.setHeader('Content-Type','text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition',`attachment; filename="${filename}"`);
+
+    const lines=[
+      ['Learner ID','Admission No','Learner Name','Mark (Max: '+a.max_mark+')','Status / Remark (X=Absent, Y=Irregularity, M=Medical)'].map(escCsv).join(',')
+    ];
+    for(const l of learners){
+      const name=[l.first_name,l.middle_name,l.last_name].filter(Boolean).join(' ');
+      const val=l.mark!=null?String(l.mark):(l.remark&&SPECIAL_MARK_CODES.has(String(l.remark).toUpperCase())?String(l.remark).toUpperCase():'');
+      const rem=l.remark||'';
+      lines.push([l.learner_id,l.admission_no||'',name,val,rem].map(escCsv).join(','));
+    }
+    return res.send(lines.join('\r\n'));
+  }catch(e){console.error('CSV template error:',e);res.status(e.status||400).json({error:e.message||'Unable to generate CSV'});}
+});
+
+// Bulk Upload Marks via CSV text or array
+router.post('/:schoolId/assignment/:assignmentId/marks-upload-csv',schoolBoundary,roles('SCHOOL_ADMIN','ADMIN','HEADTEACHER','DEPUTY_HEADTEACHER','SENIOR_TEACHER','CLASS_TEACHER','TEACHER'),async(req,res)=>{
+  try{
+    await requireMarkEntryAccess(req,req.params.schoolId);
+    const sid=req.params.schoolId,aid=req.params.assignmentId,b=req.body||{};
+    const assessmentId=String(b.assessment_id||'').trim();
+    const csvContent=String(b.csv_content||'').trim();
+    if(!assessmentId)return res.status(400).json({error:'Assessment is required'});
+    if(!csvContent)return res.status(400).json({error:'CSV content is required'});
+
+    const assignment=(await db.query(`
+      SELECT a.id assignment_id,a.teacher_id,a.subject_id,a.class_id,a.academic_year_id
+      FROM teacher_subject_assignments a
+      WHERE a.id=$1 AND a.school_id=$2 AND COALESCE(a.is_active,true)=true`,[aid,sid])).rows[0];
+    if(!assignment)return res.status(404).json({error:'Teacher assignment not found'});
+    if(['TEACHER','SENIOR_TEACHER','CLASS_TEACHER'].includes(req.user.role)){
+      const own=(await db.query(`SELECT 1 FROM teachers WHERE id=$1 AND school_id=$2 AND user_id=$3 AND COALESCE(is_active,true)=true`,[assignment.teacher_id,sid,req.user.user_id])).rows[0];
+      if(!own)return res.status(403).json({error:'You are not assigned to this subject and class.'});
+    }
+
+    const assessment=(await db.query(`
+      SELECT id,max_mark,academic_year_id,term_id,deadline_at,status FROM assessments WHERE id=$1 AND school_id=$2`,[assessmentId,sid])).rows[0];
+    if(!assessment)return res.status(404).json({error:'Assessment not found'});
+    if(String(assessment.status||'OPEN').toUpperCase()!=='OPEN')return res.status(403).json({error:'Assessment is closed'});
+    if(assessment.deadline_at && new Date(assessment.deadline_at)<=new Date())return res.status(403).json({error:'Deadline has passed'});
+
+    // Parse CSV lines
+    const lines=csvContent.split(/\r?\n/).filter(x=>x.trim());
+    if(lines.length<2)return res.status(400).json({error:'CSV contains no data rows'});
+
+    // Learners for this class
+    const learners=(await db.query(`
+      SELECT DISTINCT l.id learner_id,l.admission_no,l.first_name,l.middle_name,l.last_name
+      FROM learners l
+      LEFT JOIN learner_enrollments le ON le.learner_id=l.id AND le.school_id=$1 AND le.academic_year_id=$2
+      WHERE l.school_id=$1 AND l.is_active=true AND ((le.class_id=$3) OR (le.id IS NULL AND l.class_id=$3))`,
+      [sid,assignment.academic_year_id,assignment.class_id])).rows;
+    const byId=new Map(learners.map(l=>[String(l.learner_id),l]));
+    const byAdm=new Map(learners.filter(l=>l.admission_no).map(l=>[String(l.admission_no).trim().toLowerCase(),l]));
+
+    const parseCsvRow=rowStr=>{
+      const res=[];let cur='';let inQ=false;
+      for(let i=0;i<rowStr.length;i++){
+        const c=rowStr[i];
+        if(c==='"'&&inQ&&rowStr[i+1]==='"'){cur+='"';i++;}
+        else if(c==='"'){inQ=!inQ;}
+        else if((c===','||c==='\t')&&!inQ){res.push(cur.trim());cur='';}
+        else{cur+=c;}
+      }
+      res.push(cur.trim());
+      return res;
+    };
+
+    const header=parseCsvRow(lines[0]).map(h=>h.toLowerCase());
+    let idIdx=header.findIndex(h=>h.includes('learner id')||h==='id');
+    let admIdx=header.findIndex(h=>h.includes('admission')||h.includes('adm'));
+    let markIdx=header.findIndex(h=>h.includes('mark')||h.includes('score'));
+    let remIdx=header.findIndex(h=>h.includes('status')||h.includes('remark'));
+
+    if(markIdx===-1)markIdx=header.length>3?3:header.length-1;
+
+    const rowsToSave=[];
+    for(let i=1;i<lines.length;i++){
+      const parts=parseCsvRow(lines[i]);
+      if(!parts.length)continue;
+      let matchedLearner=null;
+      if(idIdx!==-1&&parts[idIdx]&&byId.has(parts[idIdx])) matchedLearner=byId.get(parts[idIdx]);
+      else if(admIdx!==-1&&parts[admIdx]&&byAdm.has(parts[admIdx].toLowerCase())) matchedLearner=byAdm.get(parts[admIdx].toLowerCase());
+      if(!matchedLearner)continue;
+
+      const rawVal=markIdx!==-1?parts[markIdx]:'';
+      const rawRem=remIdx!==-1?parts[remIdx]:'';
+      const parsed=parseSpecialOrNumericMark(rawVal,assessment.max_mark);
+      rowsToSave.push({
+        learner_id:matchedLearner.learner_id,
+        mark:parsed.mark,
+        remark:parsed.status||rawRem||null
+      });
+    }
+
+    if(!rowsToSave.length)return res.status(400).json({error:'No matching learner rows were recognized in the CSV'});
+
+    const client=await db.pool.connect();
+    try{
+      await client.query('BEGIN');
+      let count=0;
+      for(const r of rowsToSave){
+        await client.query(`
+          INSERT INTO marks(school_id,learner_id,subject_id,class_id,academic_year_id,term_id,assessment_id,mark,entered_by,remark)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+          ON CONFLICT(learner_id,subject_id,assessment_id)
+          DO UPDATE SET mark=EXCLUDED.mark,remark=EXCLUDED.remark,entered_by=EXCLUDED.entered_by,updated_at=now()`,
+          [sid,r.learner_id,assignment.subject_id,assignment.class_id,assignment.academic_year_id,assessment.term_id,assessmentId,r.mark,req.user.user_id,r.remark]);
+        count++;
+      }
+      await client.query('COMMIT');
+      res.json({ok:true,uploaded:count,message:`Successfully saved marks for ${count} learners from CSV.`});
+    }catch(err){
+      try{await client.query('ROLLBACK');}catch{}
+      throw err;
+    }finally{
+      client.release();
+    }
+  }catch(e){console.error('CSV upload error:',e);res.status(e.status||400).json({error:e.message||'Unable to process CSV upload'});}
 });
 
 // Existing teacher download: the same stored marks are rendered as an A4 mark sheet.

@@ -66,9 +66,18 @@
   <div><b>Deadline</b><div id="markDeadline" class="deadline-open">Not set</div></div>
   <div><b>Status</b><div id="markSubmissionStatus" class="muted">Ready to save</div></div>
 </div>
-<div class="mark-toolbar"><div id="teacherMsg" class="notice">Select an assessment to begin.</div><div class="auto-save-note muted">Auto-save: on · Manual Save: available</div><div class="actions"><button class="btn primary" id="saveAllMarks" type="button">Save all marks</button><button class="btn secondary" id="markPdf" type="button">SAVE MARK SHEET PDF</button></div></div>
+<div class="mark-toolbar"><div id="teacherMsg" class="notice">Select an assessment to begin.</div><div class="auto-save-note muted">Auto-save: on · Manual Save: available</div><div class="actions"><button class="btn primary" id="saveAllMarks" type="button">Save all marks</button><button class="btn secondary" id="markPdf" type="button">SAVE MARK SHEET PDF</button><button class="btn secondary" id="downloadCsvTemplate" type="button">📥 CSV TEMPLATE</button><button class="btn secondary" id="uploadCsvBtn" type="button">📤 UPLOAD CSV</button></div></div>
+<div id="markAnalyticsKpis" class="grid" style="display:none;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin:12px 0">
+  <div class="card" style="padding:10px 14px;background:#f0fdf4;border:1px solid #bbf7d0"><span class="small muted" style="display:block">Mean Score</span><strong id="kpiMeanScore" style="font-size:1.4rem;color:#166534">—</strong><div id="kpiMeanGrade" class="small muted">—</div></div>
+  <div class="card" style="padding:10px 14px;background:#f8fafc;border:1px solid #e2e8f0"><span class="small muted" style="display:block">Highest Score</span><strong id="kpiHighest" style="font-size:1.4rem;color:#0f172a">—</strong><div class="small muted">Max mark</div></div>
+  <div class="card" style="padding:10px 14px;background:#f8fafc;border:1px solid #e2e8f0"><span class="small muted" style="display:block">Lowest Score</span><strong id="kpiLowest" style="font-size:1.4rem;color:#0f172a">—</strong><div class="small muted">Min mark</div></div>
+  <div class="card" style="padding:10px 14px;background:#eff6ff;border:1px solid #bfdbfe"><span class="small muted" style="display:block">Entered / Total</span><strong id="kpiEnteredCount" style="font-size:1.4rem;color:#1e40af">0 / 0</strong><div id="kpiEnteredPct" class="small muted">0% Complete</div></div>
+</div>
+<div id="markGradeDistribution" class="notice" style="display:none;margin-bottom:12px">
+  <b>Performance Distribution:</b> <span id="markDistBreakdown">None yet</span>
+</div>
 <div class="mark-progress-panel"><div class="small muted" id="markProgress">0 / 0 entered</div><div class="progress-track"><div id="markProgressBar" class="progress-bar"></div></div></div>
-<div class="bulk-mark-wrap"><table class="bulk-mark-table"><thead><tr><th>No.</th><th>Learner</th><th>Admission No.</th><th>Mark</th><th>Status</th></tr></thead><tbody id="bulkMarkRows"><tr><td colspan="5">Choose an assessment, class and subject to load learners.</td></tr></tbody></table></div>
+<div class="bulk-mark-wrap"><table class="bulk-mark-table"><thead><tr><th>No.</th><th>Learner</th><th>Admission No.</th><th>Mark / Status</th><th>Special Code</th><th>Status</th></tr></thead><tbody id="bulkMarkRows"><tr><td colspan="6">Choose an assessment, class and subject to load learners.</td></tr></tbody></table></div>
 </section>
 <div class="grid three"><div class="stat card"><span class="muted">Learners</span><b id="learnerCount">—</b></div><div class="stat card"><span class="muted">Teachers</span><b id="teacherCount">—</b></div><div class="stat card"><span class="muted">School template</span><b id="template">—</b></div></div>
 <section class="card admin-menu-shell pm-workflow-intro">
@@ -715,6 +724,87 @@ function updateMarkProgress(){
  const pct=total?Math.round((entered/total)*100):0;
  const label=$('markProgress');if(label)label.textContent=`${entered} / ${total} entered`;
  const bar=$('markProgressBar');if(bar)bar.style.width=`${pct}%`;
+
+ // Update Zeraki-style KPIs & Grade Distribution
+ updateMarkAnalyticsKPIs(inputs, total);
+}
+
+function updateMarkAnalyticsKPIs(inputs, total){
+ const kpiPanel=$('markAnalyticsKpis'), distPanel=$('markGradeDistribution');
+ if(!kpiPanel || !distPanel) return;
+ if(!total){ kpiPanel.style.display='none'; distPanel.style.display='none'; return; }
+
+ kpiPanel.style.display='grid';
+ distPanel.style.display='block';
+
+ const numericScores=[];
+ let absentCount=0, irregCount=0, medCount=0;
+ inputs.forEach(inp=>{
+   const v=String(inp.value||'').trim().toUpperCase();
+   if(!v) return;
+   if(v==='X') absentCount++;
+   else if(v==='Y') irregCount++;
+   else if(v==='M') medCount++;
+   else {
+     const n=Number(v);
+     if(Number.isFinite(n)) numericScores.push(n);
+   }
+ });
+
+ const entered = numericScores.length + absentCount + irregCount + medCount;
+ const pct = total ? Math.round((entered/total)*100) : 0;
+ $('kpiEnteredCount').textContent = `${entered} / ${total}`;
+ $('kpiEnteredPct').textContent = `${pct}% Complete (${total-entered} remaining)`;
+
+ if(numericScores.length){
+   const sum = numericScores.reduce((a,b)=>a+b, 0);
+   const mean = (sum / numericScores.length);
+   const highest = Math.max(...numericScores);
+   const lowest = Math.min(...numericScores);
+
+   $('kpiMeanScore').textContent = mean.toFixed(1);
+   $('kpiHighest').textContent = highest.toFixed(1);
+   $('kpiLowest').textContent = lowest.toFixed(1);
+
+   // Simple CBC / 8-4-4 style performance banding
+   // 80+ EE/A, 60-79 ME/B, 40-59 AE/C, <40 BE/D-E
+   let ee=0, me=0, ae=0, be=0;
+   numericScores.forEach(s=>{
+     if(s>=80) ee++;
+     else if(s>=60) me++;
+     else if(s>=40) ae++;
+     else be++;
+   });
+
+   let meanGrade = 'ME';
+   if(mean>=80) meanGrade = 'EE (Exceeding)';
+   else if(mean>=60) meanGrade = 'ME (Meeting)';
+   else if(mean>=40) meanGrade = 'AE (Approaching)';
+   else meanGrade = 'BE (Below)';
+   $('kpiMeanGrade').textContent = meanGrade;
+
+   let parts = [
+     `<b>80%+ (EE/A):</b> ${ee}`,
+     `<b>60–79% (ME/B):</b> ${me}`,
+     `<b>40–59% (AE/C):</b> ${ae}`,
+     `<b>Below 40% (BE/D-E):</b> ${be}`
+   ];
+   if(absentCount) parts.push(`<span class="badge" style="background:#fce8e6;color:#c5221f;padding:2px 6px;border-radius:4px">Absent (X): ${absentCount}</span>`);
+   if(irregCount) parts.push(`<span class="badge" style="background:#fef7e0;color:#b06000;padding:2px 6px;border-radius:4px">Irregularity (Y): ${irregCount}</span>`);
+   if(medCount) parts.push(`<span class="badge" style="background:#e8f0fe;color:#1a73e8;padding:2px 6px;border-radius:4px">Medical (M): ${medCount}</span>`);
+
+   $('markDistBreakdown').innerHTML = parts.join(' · ');
+ } else {
+   $('kpiMeanScore').textContent = '—';
+   $('kpiMeanGrade').textContent = 'No scores';
+   $('kpiHighest').textContent = '—';
+   $('kpiLowest').textContent = '—';
+   let specialParts = [];
+   if(absentCount) specialParts.push(`Absent (X): ${absentCount}`);
+   if(irregCount) specialParts.push(`Irregularity (Y): ${irregCount}`);
+   if(medCount) specialParts.push(`Medical (M): ${medCount}`);
+   $('markDistBreakdown').innerHTML = specialParts.length ? specialParts.join(' · ') : 'Enter marks to view performance distribution.';
+ }
 }
 function currentMarkAssessment(){
  const id=String($('markAssessment')?.value||'');
@@ -742,11 +832,27 @@ function renderBulkMarks(){
    if(e)existing.set(String(l.learner_id),e);
  });
  $('bulkMarkRows').innerHTML=rows.map((l,i)=>{
-   const e=existing.get(String(l.learner_id)),v=e&&e.mark!=null?Number(e.mark).toString():'';
+   const e=existing.get(String(l.learner_id));
+   let val = '';
+   if(e && e.mark!=null) val = Number(e.mark).toString();
+   else if(e && e.remark && ['X','Y','M'].includes(String(e.remark).toUpperCase())) val = String(e.remark).toUpperCase();
    const max=r.assessments.find(a=>String(a.id)===aid)?.max_mark||100;
    const nm=[l.first_name,l.middle_name,l.last_name].filter(Boolean).join(' ');
-   return `<tr data-learner-id="${l.learner_id}"><td>${i+1}</td><td><div class="learner-cell">${l.passport_photo_url?`<img class="passport-mini" src="${l.passport_photo_url}" alt="">`:`<span class="avatar">${(l.first_name||'?')[0]}${(l.last_name||'?')[0]}</span>`}<b>${esc(nm)}</b></div></td><td>${l.admission_no||'—'}</td><td><input class="bulk-mark-input" inputmode="decimal" type="number" step="0.01" min="0" max="${max}" value="${v}" aria-label="Enter mark for ${esc(nm)}" placeholder="Enter mark" autocomplete="off"></td><td class="save-status">${e?'Saved':'—'}</td></tr>`;
- }).join('')||'<tr><td colspan="5">No learners are enrolled in this class for the selected academic year.</td></tr>';
+   return `<tr data-learner-id="${l.learner_id}">
+     <td>${i+1}</td>
+     <td><div class="learner-cell">${l.passport_photo_url?`<img class="passport-mini" src="${l.passport_photo_url}" alt="">`:`<span class="avatar">${(l.first_name||'?')[0]}${(l.last_name||'?')[0]}</span>`}<b>${esc(nm)}</b></div></td>
+     <td>${l.admission_no||'—'}</td>
+     <td><input class="bulk-mark-input" type="text" data-max="${max}" value="${val}" aria-label="Enter mark for ${esc(nm)}" placeholder="0–${max} / X / Y / M" autocomplete="off" style="text-align:center;font-weight:bold;max-width:120px"></td>
+     <td>
+       <div class="special-code-buttons" style="display:flex;gap:4px">
+         <button type="button" class="btn mini mark-code-btn" data-code="X" title="Absent">X</button>
+         <button type="button" class="btn mini mark-code-btn" data-code="Y" title="Irregularity">Y</button>
+         <button type="button" class="btn mini mark-code-btn" data-code="M" title="Medical">M</button>
+       </div>
+     </td>
+     <td class="save-status">${e?'Saved':'—'}</td>
+   </tr>`;
+ }).join('')||'<tr><td colspan="6">No learners are enrolled in this class for the selected academic year.</td></tr>';
  updateMarkProgress();renderMarkDeadline();
 }
 let autoSaveTimers=new WeakMap();
@@ -850,6 +956,57 @@ $('markPdf')?.addEventListener('click',async()=>{
  const saved=await saveBulkMarks();
  if(saved===false)return;
  openProtectedPdf(`/api/assessments/${sid}/assignment/${a}/marks-pdf?assessment_id=${ass}`).catch(x=>alert(x.message));
+});
+$('downloadCsvTemplate')?.addEventListener('click',()=>{
+ const a=$('markAssignment').value,ass=$('markAssessment').value;
+ if(!a||!ass)return alert('Select assessment, class and subject first.');
+ const url=`/api/assessments/${sid}/assignment/${a}/marks-template-csv?assessment_id=${encodeURIComponent(ass)}`;
+ const link=document.createElement('a');
+ link.href=url;
+ link.setAttribute('download','');
+ document.body.appendChild(link);
+ link.click();
+ link.remove();
+});
+$('uploadCsvBtn')?.addEventListener('click',()=>{
+ const a=$('markAssignment').value,ass=$('markAssessment').value;
+ if(!a||!ass)return alert('Select assessment, class and subject first.');
+ const inp=document.createElement('input');
+ inp.type='file';
+ inp.accept='.csv,text/csv,text/plain';
+ inp.onchange=async()=>{
+   const file=inp.files[0];
+   if(!file)return;
+   const text=await file.text();
+   try{
+     $('teacherMsg').textContent='Uploading marks from CSV…';
+     const res=await api(`/api/assessments/${sid}/assignment/${a}/marks-upload-csv`,{
+       method:'POST',
+       body:{assessment_id:ass,csv_content:text}
+     });
+     alert(res.message||`Imported marks for ${res.uploaded} learners.`);
+     await loadBulkRoster((state.teacherAssignments||[]).find(x=>String(x.id)===String(a)),state.selectedMarkAssessmentKey);
+     $('teacherMsg').textContent=res.message;
+   }catch(err){
+     alert('CSV Upload failed: '+err.message);
+     $('teacherMsg').textContent='Upload error: '+err.message;
+   }
+ };
+ inp.click();
+});
+$('bulkMarkRows')?.addEventListener('click',e=>{
+ const btn=e.target.closest('.mark-code-btn');
+ if(btn){
+   const tr=btn.closest('tr');
+   const inp=tr?.querySelector('.bulk-mark-input');
+   if(inp && !inp.disabled){
+     const code=btn.dataset.code;
+     inp.value = (inp.value.trim().toUpperCase() === code) ? '' : code;
+     updateMarkProgress();
+     const st=tr.querySelector('.save-status');if(st)st.textContent='Unsaved · auto-save pending';
+     queueAutoSave(tr);
+   }
+ }
 });
 $('bulkMarkRows')?.addEventListener('input',e=>{
  updateMarkProgress();
